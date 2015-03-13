@@ -3,12 +3,14 @@
 from __future__ import unicode_literals
 from libcpp.string cimport string
 from libcpp.vector cimport vector
+from libcpp cimport bool
 from iostream cimport stringstream, istream, ostream, ifstream
 cimport iostream
 
 cimport _dawg
 from _dawg_builder cimport DawgBuilder
 from _dictionary cimport Dictionary
+from _dictionary_unit cimport DictionaryUnit
 from _guide cimport Guide
 from _completer cimport Completer
 from _base_types cimport BaseType, SizeType, CharType
@@ -32,6 +34,7 @@ cdef class DAWG:
     """
     cdef Dictionary dct
     cdef _dawg.Dawg dawg
+    cdef const DictionaryUnit * units_
 
     def __init__(self, arg=None, input_is_sorted=False):
         if arg is None:
@@ -227,6 +230,112 @@ cdef class DAWG:
         This may be useful e.g. for handling single-character umlauts.
         """
         return self._similar_keys("", key, self.dct.root(), replaces)
+
+
+    cdef int next_index_if_exists(self, int cur_index, int label):
+        cdef int next_index = cur_index ^ self.units_[cur_index].offset() ^ label
+        if self.units_[next_index].label() == label:
+            return next_index
+        else:
+            return -1
+
+
+    cdef list next_candidates(self, BaseType cur_index, int cp=0, int rest=0):
+        cdef list candidates = []
+        cdef int next_index, next_cp, next_rest
+
+        if rest == 0:
+            code_range = range(0x20, 0x7f) + range(0xe0, 0xfe)
+        else:
+            code_range = range(0x80, 0xc0)
+
+        for ch in code_range:
+            if ch <= 0x7f:
+                next_cp = ch
+                next_rest = 0
+            elif ch <= 0xbf:
+                # 80-BF : following bytes
+                next_cp = cp << 6 | ch & 0x3f
+                next_rest = rest - 1
+            elif ch <= 0xdf:
+                next_cp = ch & 0x1f
+                next_rest = 1
+            elif ch <= 0xef:
+                next_cp = ch & 0x0f
+                next_rest = 2
+            elif ch <= 0xf7:
+                next_cp = ch & 0x07
+                next_rest = 3
+            elif ch <= 0xfb:
+                next_cp = ch & 0x03
+                next_rest = 4
+            elif ch <= 0xfd:
+                next_cp = ch & 0x01
+                next_rest = 5
+
+            next_index = self.next_index_if_exists(cur_index, ch)
+            if next_index >= 0:
+                if next_rest > 0:
+                    candidates += self.next_candidates(next_index, next_cp, next_rest)
+                else:
+                    candidates.append( (next_cp, next_index) )
+
+        return candidates
+
+
+    cdef list _similar_keys_with_edit_distance(self, unicode current_prefix, unicode key, BaseType cur_index, list prev_row, int max_edit_distance, bool fix_the_first_letter):
+        cdef bytes first
+        cdef BaseType next_index, index = cur_index
+        cdef unicode prefix
+        cdef list candidates = [], res = [], curr_row
+        cdef int cp, next_cp
+        cdef int col, ins_cost, del_cost, repl_cost
+
+        # constraint for speed-up: fix the first letter (no other letters are tolerated)
+        if fix_the_first_letter and current_prefix == '':
+            first = key[0].encode('utf-8')
+            next_index = cur_index
+            if self.dct.Follow(first, &next_index):
+                candidates = [(ord(key[0]), next_index)]
+            else:
+                return res
+        else:
+            candidates = self.next_candidates(index)
+
+        for next_cp, next_index in candidates:
+            curr_row = [prev_row[0] + 1]
+
+            for col in range(1, len(key)+1):
+                cp = ord(key[col - 1])
+
+                ins_cost = curr_row[col - 1] + 1
+                del_cost = prev_row[col] + 1
+                repl_cost = prev_row[col - 1]
+                if cp != next_cp:
+                    repl_cost += 1
+
+                cost = min(ins_cost, del_cost, repl_cost)
+                curr_row.append(cost)
+
+            if len(curr_row) < len(prev_row): continue
+
+            if min(curr_row) <= max_edit_distance:
+                prefix = current_prefix + unichr(next_cp)
+                res += self._similar_keys_with_edit_distance(prefix, key, next_index, curr_row, max_edit_distance, fix_the_first_letter)
+
+                if curr_row[-1] <= max_edit_distance and self._has_value(next_index):
+                    res.insert(0, prefix)
+
+        return res
+
+    cpdef list similar_keys_with_edit_distance(self, unicode key, int max_edit_distance, bool fix_the_first_letter=True):
+        """
+        Return all variants of ``key`` in this DAWG according to
+        ```max_edit_distance```.
+        """
+        self.units_ = self.dct.units()
+        cdef list curr_row = range(len(key) + 1)
+        return self._similar_keys_with_edit_distance("", key, self.dct.root(), curr_row, max_edit_distance, fix_the_first_letter)
 
     cpdef list prefixes(self, unicode key):
         '''
